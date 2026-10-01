@@ -1,12 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 
-/*
+/**
  * ============================================================
- * SUPPORTED LANGUAGES
+ * SUPPORTED TRANSLATION LANGUAGES
  * ============================================================
+ *
+ * English is the source language.
+ * All other languages are translated through MyMemory.
+ *
+ * No translation text is hard-coded in this file.
  */
-
 export type SupportedTranslationLanguage =
   | 'en'
   | 'hi'
@@ -23,23 +27,25 @@ export type SupportedTranslationLanguage =
   | 'ne'
   | 'ur';
 
-type NonEnglishLanguage =
-  Exclude<
-    SupportedTranslationLanguage,
-    'en'
-  >;
+type NonEnglishLanguage = Exclude<
+  SupportedTranslationLanguage,
+  'en'
+>;
 
-/*
- * The frontend currently sends batches
- * of 6 strings.
+/**
+ * ============================================================
+ * BATCH CONFIGURATION
+ * ============================================================
  *
- * Keep the backend compatible with it.
+ * The current frontend sends batches of 6 strings.
+ *
+ * Keep this compatible with the existing frontend.
  */
 export const MAX_BATCH_SIZE = 6;
 
-/*
+/**
  * ============================================================
- * CACHE
+ * CACHE CONFIGURATION
  * ============================================================
  */
 
@@ -62,66 +68,65 @@ const CACHE_FILE =
     'translations-cache-v2.json'
   );
 
-/*
+/**
  * ============================================================
- * CONFIGURATION
+ * REQUEST CONFIGURATION
  * ============================================================
  */
 
+/**
+ * Maximum time allowed for one MyMemory request.
+ */
 const REQUEST_TIMEOUT_MS = 8000;
 
-/*
- * After a MyMemory failure / 429,
- * don't immediately hit the API again.
+/**
+ * After a failed request for a specific
+ * text/language pair, don't immediately
+ * request it again.
  */
-const FAILURE_COOLDOWN_MS =
-  60_000;
+const FAILURE_COOLDOWN_MS = 30_000;
 
-/*
- * Global provider cooldown.
- *
- * This protects Render from repeatedly
- * hitting MyMemory after a 429.
+/**
+ * After MyMemory returns HTTP 429,
+ * temporarily stop ALL MyMemory calls.
  */
-const PROVIDER_COOLDOWN_MS =
-  60_000;
+const PROVIDER_COOLDOWN_MS = 30_000;
 
-/*
- * Only ONE MyMemory request at a time.
+/**
+ * Only one external MyMemory request at a time.
  *
- * The frontend already sends groups of 6.
- * There is no reason to create a burst
- * of external requests.
+ * This is intentional.
+ *
+ * The frontend already batches strings.
+ * Sending many simultaneous requests to
+ * MyMemory can trigger 429 rate limiting.
  */
 const MAX_CONCURRENT_REQUESTS = 1;
 
-/*
- * Maximum individual text length.
+/**
+ * Don't send extremely large DOM strings
+ * to MyMemory.
  */
-const MAX_TEXT_LENGTH = 500;
+const MAX_TEXT_LENGTH = 1000;
 
-/*
+/**
  * ============================================================
- * IN-MEMORY STATE
+ * CACHE STATE
  * ============================================================
  */
 
-/*
- * Cache loaded from disk.
- */
-let cache: TranslationCache | null =
-  null;
+let cache: TranslationCache | null = null;
 
-/*
- * Same text + same language already
- * being requested.
+/**
+ * Same text + same language currently
+ * being translated.
  *
  * Example:
  *
- * "Apply Now" + "ne"
+ * "Dashboard" + "mr"
  *
- * requested 10 times at the same time
- * = only ONE MyMemory request.
+ * If requested multiple times at once,
+ * only ONE MyMemory request is made.
  */
 const pendingRequests =
   new Map<
@@ -129,8 +134,8 @@ const pendingRequests =
     Promise<string>
   >();
 
-/*
- * Requests which recently failed.
+/**
+ * Per text/language failure cooldown.
  */
 const failedUntil =
   new Map<
@@ -138,14 +143,17 @@ const failedUntil =
     number
   >();
 
-/*
+/**
  * Global MyMemory cooldown.
  */
 let providerBlockedUntil = 0;
 
-/*
- * Queue.
+/**
+ * ============================================================
+ * QUEUE
+ * ============================================================
  */
+
 type QueueItem = {
   key: string;
   text: string;
@@ -160,18 +168,15 @@ type QueueItem = {
   ) => void;
 };
 
-const requestQueue: QueueItem[] =
-  [];
+const requestQueue: QueueItem[] = [];
 
-/*
- * Number of currently running
- * MyMemory requests.
- */
 let activeRequests = 0;
 
-/*
+let queueRunning = false;
+
+/**
  * ============================================================
- * CACHE HELPERS
+ * CACHE CREATION
  * ============================================================
  */
 
@@ -182,6 +187,12 @@ function createEmptyCache(): TranslationCache {
     translations: {},
   };
 }
+
+/**
+ * ============================================================
+ * LOAD CACHE
+ * ============================================================
+ */
 
 function loadCache(): TranslationCache {
   if (cache) {
@@ -213,8 +224,7 @@ function loadCache(): TranslationCache {
 
     if (
       parsed.version !== 2 ||
-      parsed.sourceLanguage !==
-        'en' ||
+      parsed.sourceLanguage !== 'en' ||
       !parsed.translations ||
       typeof parsed.translations !==
         'object'
@@ -237,7 +247,7 @@ function loadCache(): TranslationCache {
     };
   } catch (error) {
     console.error(
-      '[Translation] Could not load cache:',
+      '[Translation] Failed to load translation cache:',
       error
     );
 
@@ -247,6 +257,12 @@ function loadCache(): TranslationCache {
 
   return cache;
 }
+
+/**
+ * ============================================================
+ * SAVE CACHE
+ * ============================================================
+ */
 
 function saveCache(): void {
   const currentCache =
@@ -262,17 +278,11 @@ function saveCache(): void {
       }
     );
 
-    /*
-     * Write to a temporary file first.
-     * This avoids leaving a partially
-     * written JSON file if the process
-     * is interrupted during write.
-     */
-    const tempFile =
+    const temporaryFile =
       `${CACHE_FILE}.tmp`;
 
     fs.writeFileSync(
-      tempFile,
+      temporaryFile,
       JSON.stringify(
         currentCache,
         null,
@@ -282,22 +292,22 @@ function saveCache(): void {
     );
 
     fs.renameSync(
-      tempFile,
+      temporaryFile,
       CACHE_FILE
     );
   } catch (error) {
-    /*
-     * Cache failure must never
+    /**
+     * Cache failure must NEVER
      * crash the application.
      */
     console.error(
-      '[Translation] Could not save cache:',
+      '[Translation] Failed to save translation cache:',
       error
     );
   }
 }
 
-/*
+/**
  * ============================================================
  * TEXT NORMALIZATION
  * ============================================================
@@ -314,9 +324,9 @@ function normalizeSourceText(
     .trim();
 }
 
-/*
+/**
  * ============================================================
- * CACHE ACCESS
+ * CACHE READ
  * ============================================================
  */
 
@@ -332,36 +342,57 @@ function getCachedTranslation(
     ?.[text];
 }
 
+/**
+ * ============================================================
+ * CACHE WRITE
+ * ============================================================
+ *
+ * Only successful translations
+ * should reach this function.
+ */
 function setCachedTranslation(
   text: string,
   language: NonEnglishLanguage,
   translatedText: string
 ): void {
+  const cleaned =
+    translatedText.trim();
+
+  if (!cleaned) {
+    return;
+  }
+
+  /**
+   * Never cache a failed fallback
+   * as a successful translation.
+   */
+  if (
+    cleaned === text
+  ) {
+    return;
+  }
+
   const currentCache =
     loadCache();
 
   if (
-    !currentCache
-      .translations[
-        language
-      ]
+    !currentCache.translations[
+      language
+    ]
   ) {
-    currentCache
-      .translations[
-        language
-      ] = {};
+    currentCache.translations[
+      language
+    ] = {};
   }
 
-  currentCache
-    .translations[
-      language
-    ]![text] =
-    translatedText;
+  currentCache.translations[
+    language
+  ]![text] = cleaned;
 
   saveCache();
 }
 
-/*
+/**
  * ============================================================
  * SUPPORTED LANGUAGE CHECK
  * ============================================================
@@ -388,9 +419,49 @@ export function isSupportedTranslationLanguage(
   ].includes(value);
 }
 
-/*
+/**
  * ============================================================
- * MYMEMORY REQUEST
+ * HTML ENTITY DECODER
+ * ============================================================
+ *
+ * MyMemory can sometimes return escaped
+ * HTML entities.
+ *
+ * No external package is required.
+ */
+function decodeHtmlEntities(
+  value: string
+): string {
+  return value
+    .replace(
+      /&amp;/g,
+      '&'
+    )
+    .replace(
+      /&lt;/g,
+      '<'
+    )
+    .replace(
+      /&gt;/g,
+      '>'
+    )
+    .replace(
+      /&quot;/g,
+      '"'
+    )
+    .replace(
+      /&#39;/g,
+      "'"
+    )
+    .replace(
+      /&#x27;/gi,
+      "'"
+    );
+}
+
+/**
+ * ============================================================
+ * MYMEMORY API REQUEST
  * ============================================================
  */
 
@@ -398,16 +469,15 @@ async function requestFromMyMemory(
   text: string,
   language: NonEnglishLanguage
 ): Promise<string> {
-  /*
-   * Do not hit MyMemory while
-   * global cooldown is active.
+  /**
+   * Global provider cooldown.
    */
   if (
     providerBlockedUntil >
     Date.now()
   ) {
     throw new Error(
-      'MyMemory provider is temporarily cooling down.'
+      'MYMEMORY_PROVIDER_COOLDOWN'
     );
   }
 
@@ -438,23 +508,29 @@ async function requestFromMyMemory(
       `en|${language}`
     );
 
-    /*
-     * Optional email support.
-     *
-     * No email is required.
+    /**
+     * Email is OPTIONAL.
      *
      * If MYMEMORY_EMAIL exists in
      * Render environment variables,
-     * it will be sent.
+     * use it.
+     *
+     * Otherwise MyMemory is called
+     * without an email.
      */
     if (
-      process.env.MYMEMORY_EMAIL
+      process.env.MYMEMORY_EMAIL &&
+      process.env.MYMEMORY_EMAIL.trim()
     ) {
       url.searchParams.set(
         'de',
-        process.env.MYMEMORY_EMAIL
+        process.env.MYMEMORY_EMAIL.trim()
       );
     }
+
+    console.log(
+      `[Translation] MyMemory request: en -> ${language}`
+    );
 
     const response =
       await fetch(
@@ -472,8 +548,15 @@ async function requestFromMyMemory(
         }
       );
 
-    /*
-     * Explicit 429 handling.
+    /**
+     * ========================================================
+     * HTTP 429
+     * ========================================================
+     *
+     * DO NOT immediately retry.
+     *
+     * Mark provider as temporarily
+     * unavailable.
      */
     if (
       response.status ===
@@ -484,15 +567,18 @@ async function requestFromMyMemory(
         PROVIDER_COOLDOWN_MS;
 
       throw new Error(
-        'MyMemory returned HTTP 429'
+        'MYMEMORY_HTTP_429'
       );
     }
 
+    /**
+     * Other HTTP errors.
+     */
     if (
       !response.ok
     ) {
       throw new Error(
-        `MyMemory returned HTTP ${response.status}`
+        `MYMEMORY_HTTP_${response.status}`
       );
     }
 
@@ -505,11 +591,16 @@ async function requestFromMyMemory(
         responseStatus?: number;
 
         quotaFinished?: boolean;
+
+        matches?: Array<{
+          translation?: string;
+        }>;
       };
 
-    /*
-     * MyMemory can report an error
-     * through responseStatus.
+    /**
+     * MyMemory can sometimes report
+     * a quota/rate-limit condition
+     * inside the JSON response.
      */
     if (
       payload.responseStatus ===
@@ -520,7 +611,7 @@ async function requestFromMyMemory(
         PROVIDER_COOLDOWN_MS;
 
       throw new Error(
-        'MyMemory returned HTTP 429'
+        'MYMEMORY_JSON_429'
       );
     }
 
@@ -533,21 +624,61 @@ async function requestFromMyMemory(
         PROVIDER_COOLDOWN_MS;
 
       throw new Error(
-        'MyMemory quota is temporarily unavailable.'
+        'MYMEMORY_QUOTA_FINISHED'
       );
     }
 
-    const translatedText =
+    /**
+     * Primary translated result.
+     */
+    let translatedText =
       payload
         .responseData
         ?.translatedText
         ?.trim();
 
+    /**
+     * Fallback to matches if needed.
+     */
+    if (
+      !translatedText &&
+      Array.isArray(
+        payload.matches
+      )
+    ) {
+      translatedText =
+        payload.matches.find(
+          (match) =>
+            typeof match.translation ===
+              'string' &&
+            match.translation.trim()
+        )?.translation?.trim();
+    }
+
     if (
       !translatedText
     ) {
       throw new Error(
-        'MyMemory returned an empty translation.'
+        'MYMEMORY_EMPTY_TRANSLATION'
+      );
+    }
+
+    translatedText =
+      decodeHtmlEntities(
+        translatedText
+      ).trim();
+
+    /**
+     * If provider returned exactly
+     * the source text, don't treat it
+     * as a useful translation.
+     */
+    if (
+      !translatedText ||
+      translatedText === text
+    ) {
+      throw new Error(
+        'MYMEMORY_UNCHANGED_TRANSLATION'
       );
     }
 
@@ -559,113 +690,197 @@ async function requestFromMyMemory(
   }
 }
 
-/*
+/**
  * ============================================================
- * REQUEST QUEUE
+ * FAIL ALL QUEUED REQUESTS
+ * ============================================================
+ *
+ * This is important for 429.
+ *
+ * Without this, requests remaining in
+ * the queue can stay unresolved.
+ */
+function failQueuedRequests(): void {
+  const items =
+    requestQueue.splice(
+      0,
+      requestQueue.length
+    );
+
+  for (
+    const item of items
+  ) {
+    pendingRequests.delete(
+      item.key
+    );
+
+    item.reject(
+      new Error(
+        'MYMEMORY_PROVIDER_COOLDOWN'
+      )
+    );
+  }
+}
+
+/**
+ * ============================================================
+ * PROCESS QUEUE
  * ============================================================
  */
 
 function processQueue(): void {
-  while (
-    activeRequests <
-      MAX_CONCURRENT_REQUESTS &&
-    requestQueue.length >
-      0
-  ) {
-    /*
-     * Global provider cooldown.
-     *
-     * Don't start another external
-     * request during cooldown.
-     */
-    if (
-      providerBlockedUntil >
-      Date.now()
-    ) {
-      return;
-    }
+  if (queueRunning) {
+    return;
+  }
 
-    const item =
-      requestQueue.shift();
+  queueRunning = true;
 
-    if (!item) {
-      return;
-    }
+  void (async () => {
+    try {
+      while (
+        requestQueue.length >
+        0
+      ) {
+        /**
+         * Provider is currently
+         * rate limited.
+         */
+        if (
+          providerBlockedUntil >
+          Date.now()
+        ) {
+          failQueuedRequests();
+          break;
+        }
 
-    activeRequests += 1;
+        /**
+         * Safety check.
+         */
+        if (
+          activeRequests >=
+          MAX_CONCURRENT_REQUESTS
+        ) {
+          break;
+        }
 
-    requestFromMyMemory(
-      item.text,
-      item.language
-    )
-      .then(
-        (
-          translatedText
-        ) => {
-          failedUntil.delete(
-            item.key
-          );
+        const item =
+          requestQueue.shift();
 
-          /*
-           * IMPORTANT:
-           * Save only successful
-           * translations.
+        if (!item) {
+          break;
+        }
+
+        activeRequests += 1;
+
+        try {
+          const translated =
+            await requestFromMyMemory(
+              item.text,
+              item.language
+            );
+
+          /**
+           * Successful translation:
+           * save it to cache.
            */
           setCachedTranslation(
             item.text,
             item.language,
-            translatedText
+            translated
+          );
+
+          failedUntil.delete(
+            item.key
           );
 
           item.resolve(
-            translatedText
+            translated
           );
-        }
-      )
-      .catch(
-        (error) => {
+        } catch (error) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : String(error);
+
           console.error(
-            `[Translation] MyMemory request failed for ${item.language}:`,
-            error
+            `[Translation] MyMemory request failed for ${item.language}: ${message}`
           );
 
-          /*
-           * Per-string cooldown.
+          /**
+           * 429 / provider cooldown.
+           *
+           * Fail the current request
+           * and all queued requests.
            */
-          failedUntil.set(
-            item.key,
-            Date.now() +
-              FAILURE_COOLDOWN_MS
-          );
+          if (
+            message ===
+              'MYMEMORY_HTTP_429' ||
+            message ===
+              'MYMEMORY_JSON_429' ||
+            message ===
+              'MYMEMORY_QUOTA_FINISHED' ||
+            message ===
+              'MYMEMORY_PROVIDER_COOLDOWN'
+          ) {
+            failedUntil.set(
+              item.key,
+              Date.now() +
+                FAILURE_COOLDOWN_MS
+            );
 
-          item.reject(
-            error
-          );
-        }
-      )
-      .finally(
-        () => {
-          activeRequests -=
-            1;
+            item.reject(
+              error
+            );
+
+            failQueuedRequests();
+          } else {
+            /**
+             * Normal failure.
+             *
+             * Cool down this specific
+             * text/language pair only.
+             */
+            failedUntil.set(
+              item.key,
+              Date.now() +
+                FAILURE_COOLDOWN_MS
+            );
+
+            item.reject(
+              error
+            );
+          }
+        } finally {
+          activeRequests -= 1;
 
           pendingRequests.delete(
             item.key
           );
-
-          /*
-           * Process another request
-           * only if provider is not
-           * globally blocked.
-           */
-          processQueue();
         }
-      );
-  }
+      }
+    } finally {
+      queueRunning = false;
+
+      /**
+       * If something was added while
+       * the queue was finishing,
+       * process it again.
+       */
+      if (
+        requestQueue.length >
+          0 &&
+        providerBlockedUntil <=
+          Date.now()
+      ) {
+        processQueue();
+      }
+    }
+  })();
 }
 
-/*
+/**
  * ============================================================
- * SINGLE TRANSLATION
+ * SINGLE TEXT TRANSLATION
  * ============================================================
  */
 
@@ -681,9 +896,9 @@ export async function translateText(
       text
     );
 
-  /*
-   * English does not need
-   * MyMemory.
+  /**
+   * English:
+   * no external API call.
    */
   if (
     language === 'en' ||
@@ -695,9 +910,8 @@ export async function translateText(
     };
   }
 
-  /*
-   * Don't send huge strings
-   * to MyMemory.
+  /**
+   * Ignore extremely large text.
    */
   if (
     normalizedText.length >
@@ -712,7 +926,7 @@ export async function translateText(
   const targetLanguage =
     language as NonEnglishLanguage;
 
-  /*
+  /**
    * ==========================================================
    * 1. CACHE FIRST
    * ==========================================================
@@ -733,9 +947,9 @@ export async function translateText(
     };
   }
 
-  /*
+  /**
    * ==========================================================
-   * 2. GLOBAL PROVIDER COOLDOWN
+   * 2. GLOBAL 429 COOLDOWN
    * ==========================================================
    */
 
@@ -749,12 +963,18 @@ export async function translateText(
     };
   }
 
+  /**
+   * ==========================================================
+   * 3. REQUEST KEY
+   * ==========================================================
+   */
+
   const key =
     `${targetLanguage}\u0000${normalizedText}`;
 
-  /*
+  /**
    * ==========================================================
-   * 3. SAME REQUEST ALREADY RUNNING?
+   * 4. SAME REQUEST ALREADY RUNNING
    * ==========================================================
    */
 
@@ -780,19 +1000,19 @@ export async function translateText(
     }
   }
 
-  /*
+  /**
    * ==========================================================
-   * 4. PREVIOUS FAILURE COOLDOWN
+   * 5. SPECIFIC FAILURE COOLDOWN
    * ==========================================================
    */
 
-  const failedAt =
+  const failedUntilTime =
     failedUntil.get(
       key
     ) ?? 0;
 
   if (
-    failedAt >
+    failedUntilTime >
     Date.now()
   ) {
     return {
@@ -801,9 +1021,9 @@ export async function translateText(
     };
   }
 
-  /*
+  /**
    * ==========================================================
-   * 5. CREATE ONE SHARED REQUEST
+   * 6. CREATE SHARED PROMISE
    * ==========================================================
    */
 
@@ -834,9 +1054,9 @@ export async function translateText(
     request
   );
 
-  /*
+  /**
    * ==========================================================
-   * 6. PUT INTO QUEUE
+   * 7. ADD TO QUEUE
    * ==========================================================
    */
 
@@ -852,9 +1072,9 @@ export async function translateText(
 
   processQueue();
 
-  /*
+  /**
    * ==========================================================
-   * 7. WAIT FOR RESULT
+   * 8. WAIT
    * ==========================================================
    */
 
@@ -867,9 +1087,9 @@ export async function translateText(
       cached: false,
     };
   } catch {
-    /*
-     * Translation failure must
-     * never break the application.
+    /**
+     * Translation must never
+     * break the application.
      */
     return {
       text,
@@ -878,39 +1098,9 @@ export async function translateText(
   }
 }
 
-/*
+/**
  * ============================================================
  * BATCH TRANSLATION
- * ============================================================
- *
- * IMPORTANT:
- *
- * The frontend currently sends:
- *
- * {
- *   language: "ne",
- *   texts: [
- *     "Dashboard",
- *     "Create Account",
- *     ...
- *   ]
- * }
- *
- * This function translates each unique
- * English string through translateText().
- *
- * translateText() already handles:
- *
- * - cache
- * - request deduplication
- * - queue
- * - MyMemory
- * - 429 cooldown
- * - timeout
- * - failure fallback
- *
- * Therefore we do NOT create a second
- * independent MyMemory implementation here.
  * ============================================================
  */
 
@@ -925,8 +1115,12 @@ export async function translateBatch(
   >;
   retryAfter?: number;
 }> {
-  /*
-   * Remove duplicate strings.
+  /**
+   * Remove duplicates.
+   *
+   * This prevents the same English
+   * text from being processed multiple
+   * times in one batch.
    */
   const uniqueTexts =
     Array.from(
@@ -957,10 +1151,9 @@ export async function translateBatch(
     Record<string, string> =
     {};
 
-  /*
-   * English mode:
-   *
-   * no MyMemory call.
+  /**
+   * English:
+   * return source strings.
    */
   if (
     language === 'en'
@@ -978,20 +1171,19 @@ export async function translateBatch(
     };
   }
 
-  /*
-   * If provider is cooling down,
-   * return no translations.
-   *
-   * The frontend will keep English
-   * and apply its own retry cooldown.
+  /**
+   * ==========================================================
+   * GLOBAL PROVIDER COOLDOWN
+   * ==========================================================
    */
+
   if (
     providerBlockedUntil >
     Date.now()
   ) {
     return {
       language,
-      translations: {},
+      translations,
       retryAfter: Math.ceil(
         (
           providerBlockedUntil -
@@ -1001,23 +1193,29 @@ export async function translateBatch(
     };
   }
 
-  /*
-   * Translate all unique strings.
-
+  /**
+   * ==========================================================
+   * PROCESS UNIQUE STRINGS
+   * ==========================================================
    *
-   * Promise.all is safe here because
-   * translateText() itself uses the
-   * server-side queue and concurrency
-   * limit.
+   * translateText() handles:
+   *
+   * - cache
+   * - duplicate requests
+   * - queue
+   * - MyMemory
+   * - timeout
+   * - 429 cooldown
+   * - failure handling
    */
+
   await Promise.all(
     uniqueTexts.map(
       async (
         text
       ) => {
-        /*
-         * Check cache before creating
-         * any new external work.
+        /**
+         * Check cache once more.
          */
         const cached =
           getCachedTranslation(
@@ -1040,16 +1238,13 @@ export async function translateBatch(
             language
           );
 
-        /*
-         * IMPORTANT:
+        /**
+         * Only return a successful
+         * translation.
          *
-         * Only add a translation when
-         * it is actually different from
-         * the original English text.
-         *
-         * This prevents a failed request
-         * from being incorrectly cached
-         * as a successful translation.
+         * Failed requests return
+         * the original English text
+         * from translateText().
          */
         if (
           result.text !==
@@ -1062,9 +1257,10 @@ export async function translateBatch(
     )
   );
 
-  /*
-   * If MyMemory became blocked during
-   * this batch, tell the frontend.
+  /**
+   * If a 429 happened during this
+   * batch, tell the frontend how long
+   * to wait.
    */
   if (
     providerBlockedUntil >
